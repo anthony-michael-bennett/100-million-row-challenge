@@ -37,7 +37,7 @@ php tempest data:validate
 
 ## Output formatting rules
 
-You'll be parsing millions of CSV lines into a JSON file. You'll need to take several things into account:
+You'll be parsing millions of CSV lines into a JSON file, with the following rules in mind:
 
 - Each entry in the final file should be a key-value pair with the page's URL path as the key and an array with the number of visits per day as the value.
 - Visits should be sorted by date in ascending order.
