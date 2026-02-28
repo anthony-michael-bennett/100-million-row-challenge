@@ -124,8 +124,7 @@ final class Parser
                     $handle = fopen($inputPath, "r");
                     fseek($handle, $pos, SEEK_SET);
                     $file_contents = fread($handle, $endpos - $pos);
-                    
-                    $endpos = strlen($file_contents);// $endpos - $pos;
+                    $endpos = strlen($file_contents);
                     $pos = 0;
                     fclose($handle);
                 }
