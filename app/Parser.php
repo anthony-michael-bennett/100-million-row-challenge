@@ -1,5 +1,4 @@
 <?php
-#ini_set('memory_limit', '1024M'); // or '1G'
 namespace App;
 
 use Exception;
@@ -89,10 +88,198 @@ final class Parser
         ];
     }
 
-    public function create_workers($inputPath, $num_workers, $time_buckets) {
+    public function create_workers($num_workers, $worker_callback) {
 
-        // PHP has copy-on-write. No extra memory for read then fork.
-        // This isn't more efficient for me. It might be in some situations.
+        $workers = [];
+    
+        for ($i = 0; $i < $num_workers; $i++) {
+            $worker = $this->create_worker($i, $worker_callback);
+            $workers[$worker["pid"]] = $worker;
+        }
+
+        return $workers;
+    }
+
+    public function listen_for_workers($workers, $parent_callback, $all_done) {
+
+        $master_sockets = [];
+        foreach ($workers as $worker) {
+            $master_sockets[$worker["pid"]] = $worker["socket"];
+        }
+
+         // Parent continues here: wait for and collect results
+        while (count($master_sockets) > 0) {
+            $read = $master_sockets;
+            $write = $except = null;
+            $timeout = 1; // Wait up to 1 second for data
+            
+            // Use stream_select to efficiently monitor which sockets have data to read
+            if (stream_select($read, $write, $except, $timeout) > 0) {
+                foreach ($read as $socket) {
+                    $pid = array_search($socket, $master_sockets, true);
+
+                    // Read data from the socket
+                    $message = $this->receive_message($socket);
+
+                    if ($message === false || $message === "") {
+                        // Connection closed, child exited
+                        pcntl_waitpid($pid, $status); // Reap the zombie process
+                        fclose($socket);
+                        unset($master_sockets[$pid]);
+                    } else {
+                        // Process the received data
+                        $parent_callback($message);
+                    }
+                }
+            }
+        }
+
+        $all_done();
+    }
+
+    public function create_worker($i, $worker_callback) {
+
+        // Create a new full-duplex socket pair before each fork
+        $sockets = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+
+        if ($sockets === false) {
+            die("Failed to create socket pair.\n");
+        }
+
+        $pid = pcntl_fork();
+
+        if ($pid == -1) {
+            die("Failed to fork process.\n");
+        } elseif ($pid === 0) {
+
+            // Child process. Close the parent's end of the socket
+            fclose($sockets[1]);
+            $result = $worker_callback($i, [
+                "socket" => $sockets[0],
+                "pid" => getmypid(),
+            ]);
+            $this->send_message($sockets[0], $result);
+            exit(0);
+        }
+
+        // Parent process. Close the child's end of the socket
+        fclose($sockets[0]);
+
+        return [
+            "socket" => $sockets[1],
+            "pid" => $pid
+        ];
+    }
+
+    public function count_urls($worker_data, $worker) {
+
+        $inputPath = $worker_data["inputPath"];
+        $time_buckets = $worker_data["time_buckets"];
+
+        $file_contents = $worker_data["file_contents"];
+        $num = $worker_data["num"];
+        $pos = $worker_data["pos"];
+        $endpos = $worker_data["endpos"];
+
+        // process
+        $key_num = 0;
+        $data = ["worker_num" => $num, "hits" => []];
+
+        $file = new \SplFileObject($inputPath, 'r');
+        $file->setFlags(\SplFileObject::DROP_NEW_LINE);
+        $file->fseek($pos);
+
+        while (!$file->eof() && $file->ftell() < $endpos) {
+            $line = $file->fgets();
+            // The date format is same length so we can use that instead of looking for comma.
+            // Using negatives we can substr from relation to end of string.
+            # 2024-05-26T19:20:37+00:00
+            $url = substr($line, 19, -26);
+            $date = substr($line, -25, 10);
+
+            # we need to check if the url has buckets and if not set to clone
+            $data["hits"][$url] ??= ["worker_num"=>$num, "key_num"=>$key_num++, "counts"=>clone $time_buckets["buckets"]];
+
+            # Fixed arrays are faster so we used a fixed number of slots for
+            # counts based on last five or six years.
+            $date_index = $time_buckets["date_to_index"][$date];
+            $data["hits"][$url]["counts"][$date_index] = $data["hits"][$url]["counts"][$date_index] + 1;
+        }
+
+        return $data;
+    }
+
+    public function process_worker_counts($worker_data, &$data) {
+        foreach ($worker_data as $key=>$value) {
+            // use worker data as counts when url isn't set
+            if (!isset($data[$key])) {  
+                $data[$key] = $value;
+                continue;
+            }
+
+            // adjust rank
+            // We need rank because the validator doesn't like when the urls
+            // are in different order than the input file and we're doing things in parallel. 
+            if ($data[$key]["worker_num"] > $value["worker_num"]) {
+                $data[$key]["worker_num"] = $value["worker_num"];
+                $data[$key]["key_num"] = $value["key_num"];
+                // considering making rank $worker_num * 100million + key_num
+            }
+
+            // add counts to existing data
+            // structure is now counts, worker_num, key_num for value
+
+            foreach($value["counts"] as $i=>$v) {
+                $data[$key]["counts"][$i] += $v;
+            }
+        }
+    }
+
+    public function finalize_counts(&$data, $time_buckets) {
+        // sort by worker and key nums to get order appeared in file
+        uksort($data, function($a, $b) use ($data) {
+            $cmp = $data[$a]["worker_num"] <=> $data[$b]["worker_num"];
+            if ($cmp !== 0) {
+                return $cmp;
+            }
+            return $data[$a]["key_num"] <=> $data[$b]["key_num"];
+        });
+
+        // convert from the fast indexed fixed arrays to date keys, remove zeros counts. remove sort data
+        $index_to_date = $time_buckets["index_to_date"];
+
+        foreach ($data as $key=>$value) {
+            $new_array = [];
+            foreach($value["counts"] as $i=>$v) {
+                if ($v !== 0 && $v !== null) {
+                    $new_array[$index_to_date[$i]] = $v;
+                }
+            }
+            $data[$key] = $new_array;
+        }
+    }
+
+    public function send_message($socket, $message) {
+        $serialized_message = json_encode($message);
+        fwrite($socket, $serialized_message);
+        //fclose($socket);
+    }
+
+    public function receive_message($socket) {
+        $data = fgets($socket);
+        if ($data === false || $data === "") {
+            return false;
+        }
+        return json_decode($data, true);
+    }
+
+    public function parse(string $inputPath, string $outputPath): void
+    {
+        $data = [];
+        $num_workers = 10;
+        $end_year = date("Y", time());
+        $start_year = $end_year - 5;
+        $time_buckets = $this->create_time_buckets($start_year, $end_year);
 
         $read_file_in_parent = false;
 
@@ -104,190 +291,36 @@ final class Parser
             $chonks = $this->get_chonks($inputPath, $num_workers);
         }
 
-        $workers = array_fill(0, $num_workers, null);
+        $worker_callback = function($i, $worker) use ($inputPath, $time_buckets, $chonks, $file_contents) {
+            [$pos, $endpos] = $chonks[$i];
 
-        for ($i = 0; $i < $num_workers; $i++) {
-            # create a place to save/get the playload
-            $shm_key = $this->gen_shm_key($i);
-            $this->write_shared_key($shm_key, "running", "c");
-            $pid = pcntl_fork();
+            $worker_data = [
+                "num" => "$i",
+                "inputPath" => $inputPath,
+                "time_buckets" => $time_buckets,
+                "pos" => $pos,
+                "endpos" => $endpos,
+                "file_contents" => $file_contents,
+            ];
 
-            if ($pid == -1) {
-                die('could not fork');
-            } else if ($pid == 0) {
+            $result = $this->count_urls($worker_data, $worker);
+            return $result;
+        };
 
-                // child
+        $parent_callback = function($message) use (&$data) {
+            $this->process_worker_counts($message["hits"], $data);
+        };
 
-                [$pos, $endpos] = $chonks[$i];
+        $all_done = function() use (&$data, $time_buckets, $outputPath) {
+            echo "All workers done\n";
+            $this->finalize_counts($data, $time_buckets);
 
-                if ($file_contents === null) {
-                    $handle = fopen($inputPath, "r");
-                    fseek($handle, $pos, SEEK_SET);
-                    $file_contents = fread($handle, $endpos - $pos);
-                    $endpos = strlen($file_contents);
-                    $pos = 0;
-                    fclose($handle);
-                }
+            $jsonHandle = fopen($outputPath, 'w');
+            fwrite($jsonHandle, json_encode($data, JSON_PRETTY_PRINT));
+        };
 
-                $this->worker($pos, $endpos, $shm_key, $time_buckets, $file_contents, $inputPath);
-                exit(0);            
 
-            } else {
-
-                // parent
-
-                $workers[$i] =  [
-                    "pid" => $pid,
-                    "shm_key" => $shm_key,
-                    "running" => true
-                ];
-            }
-        }
-        return $workers;
-    }
-
-    public function worker($pos, $endpos, $shm_key, $time_buckets, $file_contents) {
-
-        // process
-        while ($pos < $endpos) {
-            $next_newline = strpos($file_contents, "\n", $pos) ?: $endpos;
-            $line = substr($file_contents, $pos, $next_newline-$pos);
-            $pos = $next_newline+1;
-            // The date format is same length so we can use that instead of looking for comma.
-            // Using negatives we can substr from relation to end of string.
-            # 2024-05-26T19:20:37+00:00
-            $url = substr($line, 19, -26);
-            $date = substr($line, -25, 10);
-
-            # we need to check if the url has buckets and if not set to clone
-            $data[$url] ??= clone $time_buckets["buckets"];
-
-            # Fixed arrays are faster so we used a fixed number of slots for
-            # counts based on last five or six years.
-            $date_index = $time_buckets["date_to_index"][$date];
-            $data[$url][$date_index] = $data[$url][$date_index] + 1;
-        }
-
-        $this->write_shared_key($shm_key, $data);
-    }
-
-    public function gen_shm_key($num) {
-        return ftok(__FILE__, chr(65 + $num));
-    }
-
-    // use mode c for create
-    public function write_shared_key($shm_key, $data, $mode = "w") {
-        $serializedData = json_encode($data);
-        $size = strlen($serializedData);
-
-        // 1. Open/Create and write (Resize by recreating if needed)
-        if ($mode === "w") {
-            $shm_id = shmop_open($shm_key, $mode, 0, 0); // Try to open existing
-            if ($shm_id) {
-                shmop_delete($shm_id); // Delete existing
-            }
-        }
-        
-        $shm_id = shmop_open($shm_key, "c", 0644, $size); // Create new with correct size
-
-        // 2. Write data
-        shmop_write($shm_id, $serializedData, 0);
-    }
-
-    public function read_shared_key($shm_key) {
-        $shm_id = shmop_open($shm_key, "a", 0, 0);
-        if ($shm_id === false) {
-            die('Failed to open shared memory segment');
-        }
-        $data = shmop_read($shm_id, 0, shmop_size($shm_id));
-        shmop_delete($shm_id);
-        return json_decode($data, true);
-    }
-
-    public function worker_status($worker) {
-        $pid = $worker["pid"];
-        $status = null;
-        $result = pcntl_waitpid($pid, $status, WNOHANG);
-        if ($result == 0) {
-            return "running";
-        } else if ($result == -1) {
-            return "exited";
-        } else {
-            return "exited";
-        }
-    }
-
-    public function parse(string $inputPath, string $outputPath): void
-    {
-        $data = [];
-        $num_workers = 7;
-        $end_year = date("Y", time());
-        $start_year = $end_year - 5;
-        $time_buckets = $this->create_time_buckets($start_year, $end_year);
-        $workers = $this->create_workers($inputPath, $num_workers, $time_buckets);
-
-         // wait for workers
-         // - process worker payload as soon as any worker has finished
-         // - read data from shared memory only when worker is done to avoid locking and waiting
-
-        while(count($workers) > 0) {
-            $status = null;
-            $check_pid = pcntl_wait($status, WUNTRACED); // blocks until a worker changes state (exits, is signaled, or is stopped)
-
-            // There was a change of state to a child pid. Was it a worker?
-            $worker_key = array_find_key($workers, function($w) use ($check_pid) {
-                return $w["pid"] == $check_pid;
-            });
-
-            if ($worker_key === null) {
-                continue; // Not a worker, ignore.
-            }
-
-            $worker = $workers[$worker_key];
-            
-            if (pcntl_wifexited($status)) {                
-                // worker is done. Remove from workers and read data.
-                unset($workers[$worker_key]);
-                $process_data = $this->read_shared_key($worker["shm_key"]);
-
-                foreach ($process_data as $key=>$value) {
-                    // use worker data as counts when url isn't set
-                    if (!isset($data[$key])) {  
-                        $data[$key] = $value;
-                        continue;
-                    }
-
-                    // add counts to existing data
-                    foreach($value as $i=>$v) {
-                        $data[$key][$i] += $v;
-                    }
-                }
-
-            } elseif (pcntl_wifsignaled($status)) {
-                // killed by signal
-                // attempt to kill process if still running and log error
-                unset($workers[$worker_key]);
-            } elseif (pcntl_wifstopped($status)) {
-                // stopped by signal
-                // attempt to kill process if still running and log error
-                unset($workers[$worker_key]);
-            }
-        }
-        
-        $index_to_date = $time_buckets["index_to_date"];
-
-        // convert from the fast indexed fixed arrays to date keys, remove zeros counts.
-        foreach ($data as $key=>$value) {
-            $new_array = [];
-            foreach($value as $i=>$v) {
-                if ($v !== 0 && $v !== null) {
-                    $new_array[$index_to_date[$i]] = $v;
-                }
-            }
-            $data[$key] = $new_array;
-        }
-
-        $jsonHandle = fopen($outputPath, 'w');
-        fwrite($jsonHandle, json_encode($data, JSON_PRETTY_PRINT));
+        $workers = $this->create_workers($num_workers, $worker_callback);
+        $this->listen_for_workers($workers, $parent_callback, $all_done);
     }
 }
